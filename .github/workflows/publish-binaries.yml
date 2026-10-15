@@ -1,0 +1,79 @@
+name: Publish verified phone binaries
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag
+        required: true
+      android_url:
+        description: Finished Expo APK artifact URL
+        required: true
+      ios_url:
+        description: Finished Expo unsigned IPA artifact URL
+        required: true
+      android_sha256:
+        description: SHA256 of the verified APK
+        required: true
+      ios_sha256:
+        description: SHA256 of the verified unsigned device IPA
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: publish-phone-binaries
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      ANDROID_URL: ${{ inputs.android_url }}
+      IOS_URL: ${{ inputs.ios_url }}
+      ANDROID_SHA256: ${{ inputs.android_sha256 }}
+      IOS_SHA256: ${{ inputs.ios_sha256 }}
+    steps:
+      - name: Download exactly the binaries verified before publication
+        shell: python
+        run: |
+          import hashlib, os, re, urllib.request, urllib.parse
+          from pathlib import Path
+          tag = os.environ['RELEASE_TAG']
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.-]+)?', tag)
+          lines = []
+          for platform, suffix in [('ANDROID', '.apk'), ('IOS', '-unsigned.ipa')]:
+              url = os.environ[platform + '_URL']
+              parsed = urllib.parse.urlparse(url)
+              assert parsed.scheme == 'https' and parsed.hostname == 'expo.dev'
+              expected = os.environ[platform + '_SHA256'].lower()
+              assert re.fullmatch('[0-9a-f]{64}', expected)
+              target = Path('powerout-' + tag + suffix)
+              request = urllib.request.Request(url, headers={'User-Agent': 'eas-cli/24.14.0'})
+              digest = hashlib.sha256()
+              with urllib.request.urlopen(request, timeout=120) as response, target.open('wb') as output:
+                  while chunk := response.read(1024 * 1024):
+                      output.write(chunk)
+                      digest.update(chunk)
+              assert digest.hexdigest() == expected, 'Downloaded build checksum mismatch'
+              lines.append(expected + '  ' + target.name + '\n')
+          Path('SHA256SUMS.txt').write_text(''.join(lines))
+      - name: Upload to draft and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = true
+          gh release upload "$RELEASE_TAG" \
+            "powerout-$RELEASE_TAG.apk" \
+            "powerout-$RELEASE_TAG-unsigned.ipa" SHA256SUMS.txt --clobber
+          gh release view "$RELEASE_TAG" --json assets > uploaded-assets.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          tag = os.environ['RELEASE_TAG']
+          names = [f'powerout-{tag}.apk', f'powerout-{tag}-unsigned.ipa', 'SHA256SUMS.txt']
+          actual = {a['name']: a['size'] for a in json.loads(Path('uploaded-assets.json').read_text())['assets']}
+          assert actual == {n: Path(n).stat().st_size for n in names}, 'Release assets do not match'
+          PY
+          gh release edit "$RELEASE_TAG" --draft=false
