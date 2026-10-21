@@ -6,14 +6,14 @@ on:
         description: Existing draft release tag
         required: true
       android_url:
-        description: Finished Expo APK artifact URL
-        required: true
+        description: Finished Expo APK artifact URL (omit for an iOS-only fix)
+        required: false
       ios_url:
         description: Finished Expo unsigned IPA artifact URL
         required: true
       android_sha256:
-        description: SHA256 of the verified APK
-        required: true
+        description: SHA256 of the verified APK (omit with android_url)
+        required: false
       ios_sha256:
         description: SHA256 of the verified unsigned device IPA
         required: true
@@ -45,6 +45,9 @@ jobs:
           lines = []
           for platform, suffix in [('ANDROID', '.apk'), ('IOS', '-unsigned.ipa')]:
               url = os.environ[platform + '_URL']
+              if platform == 'ANDROID' and not url:
+                  assert not os.environ[platform + '_SHA256'], 'Android URL and checksum must both be supplied or omitted'
+                  continue
               parsed = urllib.parse.urlparse(url)
               assert parsed.scheme == 'https' and parsed.hostname == 'expo.dev'
               expected = os.environ[platform + '_SHA256'].lower()
@@ -64,15 +67,19 @@ jobs:
         run: |
           set -euo pipefail
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = true
-          gh release upload "$RELEASE_TAG" \
-            "powerout-$RELEASE_TAG.apk" \
-            "powerout-$RELEASE_TAG-unsigned.ipa" SHA256SUMS.txt --clobber
+          files=("powerout-$RELEASE_TAG-unsigned.ipa" SHA256SUMS.txt)
+          if [[ -f "powerout-$RELEASE_TAG.apk" ]]; then
+            files+=("powerout-$RELEASE_TAG.apk")
+          fi
+          gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
           gh release view "$RELEASE_TAG" --json assets > uploaded-assets.json
           python - <<'PY'
           import json, os
           from pathlib import Path
           tag = os.environ['RELEASE_TAG']
-          names = [f'powerout-{tag}.apk', f'powerout-{tag}-unsigned.ipa', 'SHA256SUMS.txt']
+          names = [f'powerout-{tag}-unsigned.ipa', 'SHA256SUMS.txt']
+          if Path(f'powerout-{tag}.apk').exists():
+              names.append(f'powerout-{tag}.apk')
           actual = {a['name']: a['size'] for a in json.loads(Path('uploaded-assets.json').read_text())['assets']}
           assert actual == {n: Path(n).stat().st_size for n in names}, 'Release assets do not match'
           PY
